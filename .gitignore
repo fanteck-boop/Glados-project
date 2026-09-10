@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+venv/
+.env
+*.wav
+tts_cache/
+tts_queue.txt
+last_spoke.txt
+model_assets/
+cache/

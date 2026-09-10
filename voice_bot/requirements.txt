@@ -1,0 +1,31 @@
+# Voice Clone Bot — requirements
+
+# Core
+numpy>=1.24
+sounddevice>=0.4
+soundfile>=0.12
+
+# LLM (local Ollama)
+requests>=2.31
+
+# STT (Whisper)
+openai-whisper>=20231117
+
+# TTS (XTTS v2 — voice cloning)
+Coqui-TTS>=0.20.0
+
+# TTS (GLaDOS — Style-Bert-VITS2, Portal voice)
+style-bert-vits2>=2.5.0
+torch>=2.0.0
+transformers>=4.30.0
+safetensors>=0.4.0
+huggingface_hub>=0.20.0
+
+# Optional: faster Whisper (alternate STT backend, faster on CPU/GPU)
+# faster-whisper>=0.10
+
+# Optional document readers
+python-docx>=1.1
+openpyxl>=3.1
+python-pptx>=0.6
+pymupdf>=1.23
