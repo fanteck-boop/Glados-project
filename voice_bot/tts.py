@@ -346,8 +346,18 @@ class TTS:
         if data.ndim > 1:
             data = data[:, 0]
         out_device = audio_cfg.get("output_device")
+        # WASAPI output devices reject sample rates other than their native
+        # rate unless auto_convert is enabled (needed since GLaDOS outputs
+        # 44.1kHz but the headset's WASAPI endpoint is natively 48kHz).
+        extra_settings = None
+        try:
+            hostapi = sd.query_devices(out_device)["hostapi"] if out_device is not None else None
+            if hostapi is not None and "wasapi" in sd.query_hostapis(hostapi)["name"].lower():
+                extra_settings = sd.WasapiSettings(auto_convert=True)
+        except Exception:
+            pass
         if out_device is not None:
-            sd.play(data, samplerate=sr, device=out_device)
+            sd.play(data, samplerate=sr, device=out_device, extra_settings=extra_settings)
         else:
             sd.play(data, samplerate=sr)
         sd.wait()

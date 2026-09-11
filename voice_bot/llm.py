@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -13,6 +14,13 @@ import requests
 from . import config as cfg
 
 logger = logging.getLogger("voice_bot.llm")
+
+
+def _system_prompt_with_time(base_prompt: str) -> str:
+    """Append the live date/time so the LLM can answer time-based questions
+    accurately instead of guessing from training data."""
+    now = datetime.now().strftime("%A, %B %d, %Y, %I:%M %p")
+    return f"{base_prompt}\n\nCurrent date and time: {now}."
 
 
 class OllamaClient:
@@ -86,7 +94,8 @@ class OllamaClient:
             self._history = self._history[-keep:]
 
     def _build_messages(self) -> list[dict[str, str]]:
-        msgs: list[dict[str, str]] = [{"role": "system", "content": self._system_prompt}]
+        system_content = _system_prompt_with_time(self._system_prompt)
+        msgs: list[dict[str, str]] = [{"role": "system", "content": system_content}]
         msgs.extend(self._history)
         return msgs
 
@@ -204,7 +213,8 @@ class GroqClient:
             self._history = self._history[-keep:]
 
     def _build_messages(self) -> list[dict[str, str]]:
-        msgs: list[dict[str, str]] = [{"role": "system", "content": self._system_prompt}]
+        system_content = _system_prompt_with_time(self._system_prompt)
+        msgs: list[dict[str, str]] = [{"role": "system", "content": system_content}]
         msgs.extend(self._history)
         return msgs
 
@@ -219,8 +229,12 @@ class GroqClient:
             "stream": False,
             "max_tokens": self._max_tokens,
             "temperature": self._temperature,
-            "reasoning_effort": "none",
         }
+        # Only reasoning-capable models accept this param; plain instruct
+        # models (e.g. allam-2-7b) reject the request outright if it's set.
+        _REASONING_MODELS = ("gpt-oss", "qwen")
+        if any(name in self._model for name in _REASONING_MODELS):
+            payload["reasoning_effort"] = "none" if "qwen" in self._model else "low"
         url = f"{self._host}/chat/completions"
         try:
             r = requests.post(

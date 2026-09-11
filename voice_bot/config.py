@@ -6,7 +6,7 @@ OLLAMA = {
     # Host where Ollama is running
     "host": "http://localhost:11434",
     # Model tag to use (must be pulled via `ollama pull <tag>`)
-    "model": "qwen3.6",
+    "model": "llama3.1:8b",
     # Context window / max tokens per response
     "max_tokens": 2048,
     # Temperature
@@ -20,30 +20,38 @@ GROQ = {
     # Groq API base URL (OpenAI-compatible).
     "host": "https://api.groq.com/openai/v1",
     # Model to use.
-    "model": "qwen/qwen3.8-27b",
-    # Max tokens per response.
-    "max_tokens": 2048,
+    "model": "allam-2-7b",
+    # Max tokens per response. GLaDOS replies are meant to be short (see
+    # LLM.system_prompt), and Groq's on-demand tier caps output tokens per
+    # request well below 2048 for this model — keep this low to avoid 429s.
+    "max_tokens": 200,
     # Temperature.
     "temperature": 0.7,
 }
 
 # Which LLM backend the bot uses: "ollama" or "groq".
-LLM_BACKEND = "groq"
+LLM_BACKEND = "ollama"
 
 # Wake-word detection. Options:
 #   - use a lightweight local engine (e.g. porcupine / vosk-based custom keyword)
 #   - or a simple energy+VAD threshold as a fallback "hotword"
 WAKE_WORD = {
-    # The phrase to listen for (lowercase). Pick something distinctive.
+    # Say this to wake GLaDOS back up after she's been put to sleep.
     "phrase": "submit",
+    # Say this any time to put GLaDOS to sleep — she'll stop listening for
+    # commands (still hears the wake phrase) until woken back up.
+    "sleep_phrase": "shutdown",
+    # If True, GLaDOS is listening and responds to everything from startup —
+    # no need to say the wake phrase first. Say the sleep phrase to pause her.
+    "start_active": True,
     # Do we run a proper keyword-spotting engine, or just VAD-based detection?
     # Set to True once you have a KWS engine installed (porcupine, etc.).
     "use_engine": False,
     # If no KWS engine: record when mic energy exceeds threshold for min_duration
     "vad_energy_threshold": 0.005,   # float 0..1, tune for your mic
-    "vad_min_duration_sec": 0.8,    # minimum spoken length to consider a wake phrase
-    # When False: every utterance goes straight to the bot (no wake word gate).
-    # When True: you must say the wake phrase first.
+    "vad_min_duration_sec": 0.3,    # minimum spoken length to consider an utterance
+    # When False: every utterance goes straight to the bot, with no
+    # wake/sleep gating at all (sleep_phrase and start_active are ignored).
     "use_wake_word": True,
 }
 

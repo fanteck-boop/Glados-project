@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -27,13 +28,16 @@ log = logging.getLogger("voice_bot.bot")
 
 
 class Bot:
-    """Wires STT → Ollama LLM → GLaDOS TTS with wake-word audio loop.
+    """Wires STT → LLM → GLaDOS TTS with an always-listening audio loop.
 
     Pipeline:
-      1. WakeWordListener streams mic, detects wake phrase ("submit"),
-         captures the following utterance as a command.
+      1. WakeWordListener streams the mic and transcribes each utterance.
+         While active, every utterance is treated as a command directly —
+         no need to say the wake phrase first. Saying the sleep phrase
+         (config.WAKE_WORD["sleep_phrase"]) pauses her; saying the wake
+         phrase (config.WAKE_WORD["phrase"]) resumes her.
       2. Command audio is transcribed by Whisper STT.
-      3. Text is sent to Ollama (Qwen 3.6) for a response.
+      3. Text is sent to the configured LLM backend for a response.
          If the text mentions file paths, those files are read first
          and their content injected as context.
       4. The LLM response is spoken back through GLaDOS TTS with
@@ -51,6 +55,11 @@ class Bot:
         self._wake: Optional[WakeWordListener] = None
         self._running = False
         self._last_tts_path: Optional[Path] = None
+        # Held around every Whisper transcribe() and GLaDOS synthesize() call
+        # (here and in WakeWordListener) so STT and TTS never touch the CUDA
+        # context concurrently — that race was causing intermittent native
+        # crashes/hangs after a few exchanges.
+        self._gpu_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -70,11 +79,15 @@ class Bot:
         """Start the wake-word listener (blocks on a background thread)."""
         if self._running:
             return
-        self._wake = WakeWordListener(self.cfg, self._stt)
+        self._wake = WakeWordListener(self.cfg, self._stt, self._gpu_lock)
         self._wake.add_callback(self._on_wake_event)
         self._wake.start()
         self._running = True
-        log.info("Bot started — listening for '%s'", self.cfg.WAKE_WORD["phrase"])
+        if self.cfg.WAKE_WORD.get("start_active", True):
+            log.info("Bot started — actively listening (say '%s' to pause, '%s' to resume)",
+                      self.cfg.WAKE_WORD.get("sleep_phrase", ""), self.cfg.WAKE_WORD["phrase"])
+        else:
+            log.info("Bot started — asleep, say '%s' to wake her", self.cfg.WAKE_WORD["phrase"])
 
     def stop(self) -> None:
         """Stop the wake-word listener."""
@@ -93,6 +106,10 @@ class Bot:
             self._handle_command(data)
         elif event == "wake_word":
             log.info("Wake word detected")
+            self._say("Hello, master.")
+        elif event == "sleep":
+            log.info("Sleep phrase detected")
+            self._say("Goodnight.")
         elif event == "utt_ready":
             pass  # intermediate utterance — ignore
         elif event == "error":
@@ -152,11 +169,12 @@ class Bot:
         if self._wake is not None:
             self._wake.set_playing_tts(True)
         try:
-            wav = self._tts.synthesize(text)
-            if wav is not None:
-                self._tts.play(wav, self.cfg.AUDIO)
-            else:
-                log.warning("TTS synthesis returned None for: %r", text[:60])
+            with self._gpu_lock:
+                wav = self._tts.synthesize(text)
+                if wav is not None:
+                    self._tts.play(wav, self.cfg.AUDIO)
+                else:
+                    log.warning("TTS synthesis returned None for: %r", text[:60])
         except Exception:
             log.exception("TTS playback failed for: %r", text[:60])
         finally:
@@ -195,64 +213,85 @@ class Bot:
         SENTENCE_PAUSE = 0.35
         COMMA_PAUSE = 0.15
 
-        # ---- Synthesize each chunk ----
-        wav_paths: list[Path] = []
-        for chunk in chunks:
-            wav = self._tts.synthesize(chunk)
-            if wav is None:
-                continue
-            wav_paths.append(wav)
+        if self._wake is not None:
+            self._wake.set_playing_tts(True)
+        try:
+            with self._gpu_lock:
+                # ---- Synthesize each chunk ----
+                wav_paths: list[Path] = []
+                for chunk in chunks:
+                    wav = self._tts.synthesize(chunk)
+                    if wav is None:
+                        continue
+                    wav_paths.append(wav)
 
-        if not wav_paths:
-            return
+                if not wav_paths:
+                    return
 
-        # ---- Concatenate WAVs with silence gaps ----
-        # Detect if a chunk ends with a sentence-ending punctuation
-        def ends_with_sentence(ch: str) -> bool:
-            return ch.strip().endswith(self.SENTENCE_ENDS)
+                # ---- Concatenate WAVs with silence gaps ----
+                # Detect if a chunk ends with a sentence-ending punctuation
+                def ends_with_sentence(ch: str) -> bool:
+                    return ch.strip().endswith(self.SENTENCE_ENDS)
 
-        import soundfile as sf
+                import soundfile as sf
 
-        # Use the first chunk's real sample rate as the target — no extra
-        # probe synthesis needed, this file was going to be read anyway.
-        _, sr = sf.read(str(wav_paths[0]), dtype="float32", always_2d=False)
-        sr = int(sr)
+                # Use the first chunk's real sample rate as the target — no extra
+                # probe synthesis needed, this file was going to be read anyway.
+                _, sr = sf.read(str(wav_paths[0]), dtype="float32", always_2d=False)
+                sr = int(sr)
 
-        merged = np.array([], dtype=np.float32)
-        for i, wp in enumerate(wav_paths):
-            data, file_sr = sf.read(str(wp), dtype="float32")
-            if data.ndim > 1:
-                data = data[:, 0]
-            # Resample if sample rate differs
-            if abs(file_sr - sr) > 1:
-                from scipy.signal import resample
+                merged = np.array([], dtype=np.float32)
+                for i, wp in enumerate(wav_paths):
+                    data, file_sr = sf.read(str(wp), dtype="float32")
+                    if data.ndim > 1:
+                        data = data[:, 0]
+                    # Resample if sample rate differs
+                    if abs(file_sr - sr) > 1:
+                        from scipy.signal import resample
 
-                new_len = int(len(data) * sr / file_sr)
-                data = resample(data, new_len)
-            merged = np.concatenate([merged, data])
+                        new_len = int(len(data) * sr / file_sr)
+                        data = resample(data, new_len)
+                        # Resampling can ring/overshoot past the original
+                        # [-1, 1] range near sharp transients (plosives,
+                        # sibilants) — clip here so that overshoot doesn't
+                        # turn into audible clipping noise later.
+                        data = np.clip(data, -1.0, 1.0)
+                    merged = np.concatenate([merged, data])
 
-            # Add silence gap after this chunk (except last)
-            if i < len(wav_paths) - 1:
-                # Determine pause length: sentence end = long, comma = short
-                chunk_text = chunks[i]
-                pause = SENTENCE_PAUSE if ends_with_sentence(chunk_text) else COMMA_PAUSE
-                gap = np.zeros(int(sr * pause), dtype=np.float32)
-                merged = np.concatenate([merged, gap])
+                    # Add silence gap after this chunk (except last)
+                    if i < len(wav_paths) - 1:
+                        # Determine pause length: sentence end = long, comma = short
+                        chunk_text = chunks[i]
+                        pause = SENTENCE_PAUSE if ends_with_sentence(chunk_text) else COMMA_PAUSE
+                        gap = np.zeros(int(sr * pause), dtype=np.float32)
+                        merged = np.concatenate([merged, gap])
 
-        # ---- Write merged WAV ----
-        import wave
+                # Trailing silence pad — gives WASAPI's sample-rate converter room
+                # to flush cleanly instead of cutting off / glitching the last chunk.
+                tail_pad = np.zeros(int(sr * 0.35), dtype=np.float32)
+                merged = np.concatenate([merged, tail_pad])
 
-        out_path = self._tts._cache_dir / f"paused_{abs(hash(text)) % 1000000}.wav"
-        merged_i16 = np.clip(merged * 32767.0, -32768, 32767).astype(np.int16)
-        with wave.open(str(out_path), "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(sr)
-            wf.writeframes(merged_i16.tobytes())
+                # Safety clip in case anything still exceeds full scale —
+                # avoids hard digital-clipping noise on the loudest chunks.
+                merged = np.clip(merged, -1.0, 1.0)
 
-        # ---- Play the full concatenated audio ----
-        self._tts.play(out_path, self.cfg.AUDIO)
-        self._last_tts_path = out_path
+                # ---- Write merged WAV ----
+                import wave
+
+                out_path = self._tts._cache_dir / f"paused_{abs(hash(text)) % 1000000}.wav"
+                merged_i16 = np.clip(merged * 32767.0, -32768, 32767).astype(np.int16)
+                with wave.open(str(out_path), "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(sr)
+                    wf.writeframes(merged_i16.tobytes())
+
+                # ---- Play the full concatenated audio ----
+                self._tts.play(out_path, self.cfg.AUDIO)
+                self._last_tts_path = out_path
+        finally:
+            if self._wake is not None:
+                self._wake.set_playing_tts(False)
 
     # ------------------------------------------------------------------
     # Text-to-speech queue (file-based IPC for external prompts)

@@ -35,10 +35,11 @@ class WakeWordListener:
         in a future iteration (config.WAKE_WORD.use_engine).
     """
 
-    def __init__(self, config: cfg.Config, stt_model: "STT"):
+    def __init__(self, config: cfg.Config, stt_model: "STT", gpu_lock: Optional[threading.Lock] = None):
         self.cfg = config
         self.sr: int = config.AUDIO["sample_rate"]
         self.phrase: str = config.WAKE_WORD["phrase"].lower()
+        self.sleep_phrase: str = config.WAKE_WORD.get("sleep_phrase", "").lower()
         self.energy_threshold: float = config.WAKE_WORD["vad_energy_threshold"]
         self.min_duration_sec: float = config.WAKE_WORD["vad_min_duration_sec"]
         self.silence_threshold: float = config.AUDIO["silence_threshold"]
@@ -46,14 +47,36 @@ class WakeWordListener:
         self.blocksize: int = 1024
 
         self._stt_model = stt_model  # injected STT wrapper
-        self._executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="wake")
+        # A single worker is intentional: there is exactly one microphone, so
+        # there is never a need to transcribe two utterances at once. This
+        # also guarantees a transcription can never run concurrently with a
+        # TTS synthesis dispatched from the same callback chain (see
+        # _gpu_lock below for the belt-and-suspenders version of that).
+        self._executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="wake")
+        # Shared with Bot: held around every Whisper transcribe() and GLaDOS
+        # synthesize() call so the two never run on the CUDA context at the
+        # same time. That concurrent-CUDA-access window (STT on one worker
+        # thread, TTS on another) was the actual cause of the intermittent
+        # native crashes/hangs after a few exchanges.
+        self._gpu_lock: threading.Lock = gpu_lock or threading.Lock()
 
-        # State machine
-        self._state: str = "idle"  # idle | expect_command
+        # Every utterance is buffered the same way; what happens once it's
+        # transcribed depends on whether the bot is active or asleep (see
+        # _on_transcription_done). No separate "wait for the command after
+        # the wake word" step — active mode treats each utterance as a
+        # command directly.
         self._utt_buffer: list[np.ndarray] = []
         self._utt_last_speech: float = 0.0
-        self._cmd_buffer: list[np.ndarray] = []
-        self._cmd_last_speech: float = 0.0
+        # Guards all of the state above — it's written from both the
+        # real-time audio callback thread and the transcription worker thread.
+        self._state_lock = threading.Lock()
+
+        # Active = responding to utterances as commands. Asleep = only
+        # listening for the wake phrase. Toggled by voice (sleep_phrase /
+        # phrase) rather than needing the wake phrase before every command.
+        self._active = threading.Event()
+        if config.WAKE_WORD.get("start_active", True):
+            self._active.set()
 
         # Continuous ring buffer of recent audio (for debugging / fallback)
         ring_max = int(self.cfg.AUDIO["sample_rate"] * 4.0)
@@ -71,8 +94,16 @@ class WakeWordListener:
         self._wake_cooldown: float = 4.0
         self._last_wake_time: float = 0.0
 
-        # TTS playing flag — set by bot when GLaDOS is speaking
+        # TTS playing flag — set by bot when GLaDOS is speaking. The mic
+        # stream itself is never stopped/restarted (that proved unreliable —
+        # some backends don't resume delivering callbacks after .stop());
+        # muting is done purely by dropping samples here.
         self._playing_tts = threading.Event()
+
+        # Diagnostics: loudest energy seen in the last ~2s, logged periodically
+        # so it's possible to tell whether the mic is hearing anything at all.
+        self._diag_max_energy: float = 0.0
+        self._diag_last_log: float = 0.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -84,10 +115,21 @@ class WakeWordListener:
             self._callbacks.append(cb)
 
     def set_playing_tts(self, playing: bool) -> None:
-        """Notify the listener whether TTS is currently playing audio."""
+        """Notify the listener whether TTS is currently playing audio.
+
+        The mic InputStream keeps running throughout — stopping/restarting
+        the same stream object was unreliable (some runs never resumed
+        delivering audio callbacks after .stop()). Muting is done purely by
+        dropping incoming samples in _on_samples while this flag is set;
+        the shared _gpu_lock is what actually prevents STT/TTS from ever
+        touching CUDA at the same time.
+        """
         if playing:
             self._playing_tts.set()
         else:
+            # Drop anything that built up while muted before resuming.
+            with self._state_lock:
+                self._utt_buffer = []
             self._playing_tts.clear()
 
     def start(self) -> None:
@@ -157,6 +199,16 @@ class WakeWordListener:
             return
 
         energy = compute_energy(samples)
+
+        # Periodic diagnostic: log the loudest energy seen every ~2s so we can
+        # tell whether the mic is actually hearing anything while idle.
+        now_diag = time.time()
+        self._diag_max_energy = max(self._diag_max_energy, energy)
+        if now_diag - self._diag_last_log > 2.0:
+            logger.info("[diag] max energy in last ~2s: %.6f (threshold %.6f)",
+                        self._diag_max_energy, self.energy_threshold)
+            self._diag_max_energy = 0.0
+            self._diag_last_log = now_diag
         now = time.time()
 
         # Maintain ring buffer
@@ -164,21 +216,16 @@ class WakeWordListener:
         while self._ring and sum(len(x) for x in self._ring) > self._ring_max_frames:
             self._ring.popleft()
 
-        if energy > self.energy_threshold:
-            self._utt_last_speech = now
-            self._cmd_last_speech = now
-            if self._state == "idle":
+        finalize = False
+        with self._state_lock:
+            if energy > self.energy_threshold:
+                self._utt_last_speech = now
                 self._utt_buffer.append(samples)
-            elif self._state == "expect_command":
-                self._cmd_buffer.append(samples)
-        else:
-            # Silence: decide whether to end an utterance
-            if self._state == "idle" and self._utt_buffer:
-                if now - self._utt_last_speech > 0.6:
-                    self._finalize_utterance("idle")
-            elif self._state == "expect_command" and self._cmd_buffer:
-                if now - self._cmd_last_speech > 0.8:
-                    self._finalize_utterance("expect_command")
+            elif self._utt_buffer and now - self._utt_last_speech > 0.6:
+                finalize = True
+
+        if finalize:
+            self._finalize_utterance()
 
     def _analyze(self) -> None:
         pass
@@ -187,33 +234,26 @@ class WakeWordListener:
     # Utterance finalization
     # ------------------------------------------------------------------
 
-    def _finalize_utterance(self, source: str) -> None:
-        buf: list[np.ndarray]
-        if source == "idle":
+    def _finalize_utterance(self) -> None:
+        with self._state_lock:
             buf = self._utt_buffer
             self._utt_buffer = []
-            if len(buf) == 0:
-                return
-            if sum(len(x) for x in buf) < int(self.min_duration_sec * self.sr):
-                return
-            self._transcribe_async(np.concatenate(buf, axis=0), source="idle")
-        elif source == "expect_command":
-            buf = self._cmd_buffer
-            self._cmd_buffer = []
-            self._state = "idle"
-            if len(buf) == 0:
-                return
-            if sum(len(x) for x in buf) < int(0.3 * self.sr):
-                return
-            self._transcribe_async(np.concatenate(buf, axis=0), source="command")
-        else:
-            raise ValueError(f"unknown source: {source}")
 
-    def _transcribe_async(self, samples: np.ndarray, source: str) -> None:
-        future: Future[tuple[Optional[str], str]] = self._executor.submit(self._stt_model.transcribe, samples)
-        future.add_done_callback(lambda f: self._on_transcription_done(f, source))
+        if len(buf) == 0:
+            return
+        if sum(len(x) for x in buf) < int(self.min_duration_sec * self.sr):
+            return
+        self._transcribe_async(np.concatenate(buf, axis=0))
 
-    def _on_transcription_done(self, future: Future, source: str) -> None:
+    def _transcribe_async(self, samples: np.ndarray) -> None:
+        def _locked_transcribe() -> Optional[str]:
+            with self._gpu_lock:
+                return self._stt_model.transcribe(samples)
+
+        future: Future[Optional[str]] = self._executor.submit(_locked_transcribe)
+        future.add_done_callback(self._on_transcription_done)
+
+    def _on_transcription_done(self, future: Future) -> None:
         try:
             text: Optional[str] = future.result()
         except Exception as e:
@@ -221,53 +261,55 @@ class WakeWordListener:
             self._notify("error", f"transcription error: {e}")
             return
 
-        if text is None:
+        if text is None or not text.strip():
             return
 
         text_lower = text.lower().strip()
         self._notify("utt_ready", text)
 
         if not self.cfg.WAKE_WORD.get("use_wake_word", True):
-            if text.strip():
-                logger.info("command captured (always-on): %r", text)
-                self._notify("command", text)
+            logger.info("command captured (always-on): %r", text)
+            self._notify("command", text)
             return
 
-        if source == "idle":
-            if self._contains_wake_phrase(text_lower):
+        if not self._active.is_set():
+            # Asleep — only the wake phrase gets a reaction.
+            if self._contains_phrase(text_lower, self.phrase):
                 now = time.time()
-                if now - self._last_wake_time < self._wake_cooldown:
-                    return
-                self._last_wake_time = now
-                logger.info("wake phrase detected: %r", text)
+                with self._state_lock:
+                    if now - self._last_wake_time < self._wake_cooldown:
+                        return
+                    self._last_wake_time = now
+                self._active.set()
+                logger.info("wake phrase detected — resuming: %r", text)
                 self._notify("wake_word", None)
-                self._state = "expect_command"
-                self._cmd_buffer = []
-                self._cmd_last_speech = time.time()
-        elif source == "command":
-            logger.info("command captured: %r", text)
-            self._notify("command", text)
-            self._cmd_buffer = []
-        else:
-            raise ValueError(f"unknown source: {source}")
+            return
+
+        # Active — the sleep phrase pauses instead of being treated as a command.
+        if self.sleep_phrase and self._contains_phrase(text_lower, self.sleep_phrase):
+            self._active.clear()
+            logger.info("sleep phrase detected — pausing: %r", text)
+            self._notify("sleep", None)
+            return
+
+        logger.info("command captured: %r", text)
+        self._notify("command", text)
 
     # ------------------------------------------------------------------
-    # Wake phrase matching
+    # Phrase matching
     # ------------------------------------------------------------------
 
     @staticmethod
     def _normalize(text: str) -> str:
-        out = []
-        for ch in text.lower():
-            if ch.isalpha() or ch.isspace():
-                out.append(ch)
-            else:
-                out.append(" ")
-        return " ".join("".join(out).split())
+        # Strips everything but letters — including spaces — so a phrase
+        # matches regardless of how Whisper happens to word-split it (e.g.
+        # "shutdown" vs "shut down" both normalize to "shutdown").
+        return "".join(ch for ch in text.lower() if ch.isalpha())
 
-    def _contains_wake_phrase(self, normalized_text: str) -> bool:
-        norm_phrase = self._normalize(self.phrase)
-        return norm_phrase in normalized_text
+    def _contains_phrase(self, text: str, phrase: str) -> bool:
+        if not phrase:
+            return False
+        return self._normalize(phrase) in self._normalize(text)
 
     # ------------------------------------------------------------------
     # Notification
