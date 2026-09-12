@@ -9,7 +9,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from . import config as cfg
 from .tts import TTS
@@ -61,6 +61,33 @@ class Bot:
         self._gpu_lock = threading.Lock()
         # Set by the interrupt phrase to cut a response short between chunks.
         self._interrupted = threading.Event()
+        # Held for the entire duration of _say/_say_with_pauses so two speech
+        # requests from different sources (a voice command, the wake/sleep
+        # greetings, queued external text) can never play over each other —
+        # playback itself isn't under _gpu_lock (that would block the
+        # interrupt phrase from being heard while she talks), so without this
+        # nothing else stops two of them overlapping.
+        self._speaking_lock = threading.Lock()
+        # Optional external listeners (e.g. the GUI) notified of high-level
+        # events: ("state", "Listening"|"Asleep"|"Speaking"), ("heard", text),
+        # ("response", text). Separate from WakeWordListener's own callback
+        # list since those are lower-level (wake_word/sleep/command/error).
+        self._gui_callbacks: list[Callable[[str, Optional[str]], None]] = []
+
+    def add_gui_callback(self, cb: Callable[[str, Optional[str]], None]) -> None:
+        """Register a callback for high-level UI events. See _gui_callbacks."""
+        self._gui_callbacks.append(cb)
+
+    def _notify_gui(self, event: str, data: Optional[str] = None) -> None:
+        for cb in list(self._gui_callbacks):
+            try:
+                cb(event, data)
+            except Exception:
+                log.exception("gui callback error")
+
+    def _revert_gui_state_after_speech(self) -> None:
+        if self._wake is not None:
+            self._notify_gui("state", "Listening" if self._wake.is_active() else "Asleep")
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -104,12 +131,15 @@ class Bot:
 
     def _on_wake_event(self, event: str, data: Optional[str]) -> None:
         if event == "command":
+            self._notify_gui("heard", data)
             self._handle_command(data)
         elif event == "wake_word":
             log.info("Wake word detected")
+            self._notify_gui("state", "Listening")
             self._say("Hello, master.")
         elif event == "sleep":
             log.info("Sleep phrase detected")
+            self._notify_gui("state", "Asleep")
             self._say("Goodnight.")
         elif event == "interrupt":
             log.info("Interrupt phrase detected — stopping playback")
@@ -152,6 +182,7 @@ class Bot:
             response = "Sorry, I couldn't think of a response."
 
         log.info("response: %r", response[:120])
+        self._notify_gui("response", response)
 
         # ---- Speak ----
         if self.cfg.LLM.get("use_pauses", True):
@@ -171,22 +202,25 @@ class Bot:
         """
         if not text:
             return
-        if self._wake is not None:
-            self._wake.set_playing_tts(True)
-        self._interrupted.clear()
-        try:
-            with self._gpu_lock:
-                wav = self._tts.synthesize(text)
-            if wav is None:
-                log.warning("TTS synthesis returned None for: %r", text[:60])
-            elif not self._interrupted.is_set():
-                self._tts.play(wav, self.cfg.AUDIO, self._interrupted)
-        except Exception:
-            log.exception("TTS playback failed for: %r", text[:60])
-        finally:
+        with self._speaking_lock:
             if self._wake is not None:
-                self._wake.set_playing_tts(False)
-        self._last_tts_path = None
+                self._wake.set_playing_tts(True)
+            self._notify_gui("state", "Speaking")
+            self._interrupted.clear()
+            try:
+                with self._gpu_lock:
+                    wav = self._tts.synthesize(text)
+                if wav is None:
+                    log.warning("TTS synthesis returned None for: %r", text[:60])
+                elif not self._interrupted.is_set():
+                    self._tts.play(wav, self.cfg.AUDIO, self._interrupted)
+            except Exception:
+                log.exception("TTS playback failed for: %r", text[:60])
+            finally:
+                if self._wake is not None:
+                    self._wake.set_playing_tts(False)
+                self._revert_gui_state_after_speech()
+            self._last_tts_path = None
 
     def _say_with_pauses(self, text: str) -> None:
         """Split text into sentence/comma chunks and speak them one at a time.
@@ -228,35 +262,42 @@ class Bot:
         def ends_with_sentence(ch: str) -> bool:
             return ch.strip().endswith(self.SENTENCE_ENDS)
 
-        if self._wake is not None:
-            self._wake.set_playing_tts(True)
-        self._interrupted.clear()
-        try:
-            with self._gpu_lock:
-                wav_paths: list[Path] = []
-                for chunk in chunks:
-                    wav = self._tts.synthesize(chunk)
-                    if wav is not None:
-                        wav_paths.append(wav)
-
-            if not wav_paths:
-                return
-
-            for i, wp in enumerate(wav_paths):
-                if self._interrupted.is_set():
-                    log.info("playback interrupted")
-                    break
-                self._tts.play(wp, self.cfg.AUDIO, self._interrupted)
-                self._last_tts_path = wp
-                if self._interrupted.is_set():
-                    log.info("playback interrupted")
-                    break
-                if i < len(wav_paths) - 1:
-                    pause = SENTENCE_PAUSE if ends_with_sentence(chunks[i]) else COMMA_PAUSE
-                    time.sleep(pause)
-        finally:
+        with self._speaking_lock:
             if self._wake is not None:
-                self._wake.set_playing_tts(False)
+                self._wake.set_playing_tts(True)
+            self._notify_gui("state", "Speaking")
+            self._interrupted.clear()
+            try:
+                with self._gpu_lock:
+                    wav_paths: list[Path] = []
+                    for chunk in chunks:
+                        wav = self._tts.synthesize(chunk)
+                        if wav is not None:
+                            wav_paths.append(wav)
+
+                if not wav_paths:
+                    return
+
+                for i, wp in enumerate(wav_paths):
+                    if self._interrupted.is_set():
+                        log.info("playback interrupted")
+                        break
+                    try:
+                        self._tts.play(wp, self.cfg.AUDIO, self._interrupted)
+                    except Exception:
+                        log.exception("TTS playback failed for chunk: %r", chunks[i][:60])
+                        break
+                    self._last_tts_path = wp
+                    if self._interrupted.is_set():
+                        log.info("playback interrupted")
+                        break
+                    if i < len(wav_paths) - 1:
+                        pause = SENTENCE_PAUSE if ends_with_sentence(chunks[i]) else COMMA_PAUSE
+                        time.sleep(pause)
+            finally:
+                if self._wake is not None:
+                    self._wake.set_playing_tts(False)
+                self._revert_gui_state_after_speech()
 
     # ------------------------------------------------------------------
     # Text-to-speech queue (file-based IPC for external prompts)
@@ -307,14 +348,15 @@ def main() -> None:
         bot.start()
         log.info("Press Ctrl+C to stop")
         while True:
-            import time
-
             time.sleep(0.5)
             # Drain any externally queued TTS text
             queued = bot._drain_queue()
             if queued:
                 log.info("speaking queued text: %r", queued[:80])
-                bot._say_with_pauses(queued)
+                try:
+                    bot._say_with_pauses(queued)
+                except Exception:
+                    log.exception("failed to speak queued text")
     except KeyboardInterrupt:
         log.info("Shutting down...")
     finally:

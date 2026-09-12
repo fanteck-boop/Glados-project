@@ -105,6 +105,12 @@ class WakeWordListener:
         self._diag_max_energy: float = 0.0
         self._diag_last_log: float = 0.0
 
+        # Most recent per-block energy reading — a plain float, updated from
+        # the audio callback thread. Read-only single-value polling (e.g. a
+        # GUI meter) doesn't need a lock for this; it's fine if a reader
+        # occasionally sees a value from one block ago.
+        self._last_energy: float = 0.0
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -113,6 +119,14 @@ class WakeWordListener:
         """Register a callback for events."""
         with self._lock:
             self._callbacks.append(cb)
+
+    def get_last_energy(self) -> float:
+        """Most recent mic energy reading, for a live level meter."""
+        return self._last_energy
+
+    def is_active(self) -> bool:
+        """True if currently responding to commands (not asleep)."""
+        return self._active.is_set()
 
     def set_playing_tts(self, playing: bool) -> None:
         """Notify the listener whether TTS is currently playing audio.
@@ -196,6 +210,7 @@ class WakeWordListener:
         # _on_transcription_done instead) so the interrupt phrase can
         # actually be heard and cut her off mid-response.
         energy = compute_energy(samples)
+        self._last_energy = energy
 
         # Periodic diagnostic: log the loudest energy seen every ~2s so we can
         # tell whether the mic is actually hearing anything while idle.
