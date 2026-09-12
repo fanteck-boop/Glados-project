@@ -7,10 +7,9 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import time
 from pathlib import Path
 from typing import Optional
-
-import numpy as np
 
 from . import config as cfg
 from .tts import TTS
@@ -60,6 +59,8 @@ class Bot:
         # context concurrently — that race was causing intermittent native
         # crashes/hangs after a few exchanges.
         self._gpu_lock = threading.Lock()
+        # Set by the interrupt phrase to cut a response short between chunks.
+        self._interrupted = threading.Event()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -110,6 +111,10 @@ class Bot:
         elif event == "sleep":
             log.info("Sleep phrase detected")
             self._say("Goodnight.")
+        elif event == "interrupt":
+            log.info("Interrupt phrase detected — stopping playback")
+            self._interrupted.set()
+            self._tts.stop()
         elif event == "utt_ready":
             pass  # intermediate utterance — ignore
         elif event == "error":
@@ -161,20 +166,21 @@ class Bot:
     def _say(self, text: str) -> None:
         """Speak text with the GLaDOS voice, routed to the ROG Strix Go headphones.
 
-        The wake-word listener is told to ignore mic input while speaking so
-        commands don't queue up mid-sentence.
+        The wake-word listener keeps listening for the interrupt phrase while
+        this plays — see set_playing_tts and WakeWordListener's gating.
         """
         if not text:
             return
         if self._wake is not None:
             self._wake.set_playing_tts(True)
+        self._interrupted.clear()
         try:
             with self._gpu_lock:
                 wav = self._tts.synthesize(text)
-                if wav is not None:
-                    self._tts.play(wav, self.cfg.AUDIO)
-                else:
-                    log.warning("TTS synthesis returned None for: %r", text[:60])
+            if wav is None:
+                log.warning("TTS synthesis returned None for: %r", text[:60])
+            elif not self._interrupted.is_set():
+                self._tts.play(wav, self.cfg.AUDIO, self._interrupted)
         except Exception:
             log.exception("TTS playback failed for: %r", text[:60])
         finally:
@@ -183,7 +189,13 @@ class Bot:
         self._last_tts_path = None
 
     def _say_with_pauses(self, text: str) -> None:
-        """Split text into sentence/comma chunks, synthesize each, concatenate with silence.
+        """Split text into sentence/comma chunks and speak them one at a time.
+
+        Each chunk is synthesized up front (under _gpu_lock, since that's the
+        GPU-bound part) but played individually, with a real pause between
+        chunks — not concatenated into one file. That gap between plays is
+        what lets the interrupt phrase actually cut a response short instead
+        of only being noticed after the whole thing finished.
 
         Pauses:
           - Sentence ending (. ! ?) → ~0.35 s silence (full breath)
@@ -213,82 +225,35 @@ class Bot:
         SENTENCE_PAUSE = 0.35
         COMMA_PAUSE = 0.15
 
+        def ends_with_sentence(ch: str) -> bool:
+            return ch.strip().endswith(self.SENTENCE_ENDS)
+
         if self._wake is not None:
             self._wake.set_playing_tts(True)
+        self._interrupted.clear()
         try:
             with self._gpu_lock:
-                # ---- Synthesize each chunk ----
                 wav_paths: list[Path] = []
                 for chunk in chunks:
                     wav = self._tts.synthesize(chunk)
-                    if wav is None:
-                        continue
-                    wav_paths.append(wav)
+                    if wav is not None:
+                        wav_paths.append(wav)
 
-                if not wav_paths:
-                    return
+            if not wav_paths:
+                return
 
-                # ---- Concatenate WAVs with silence gaps ----
-                # Detect if a chunk ends with a sentence-ending punctuation
-                def ends_with_sentence(ch: str) -> bool:
-                    return ch.strip().endswith(self.SENTENCE_ENDS)
-
-                import soundfile as sf
-
-                # Use the first chunk's real sample rate as the target — no extra
-                # probe synthesis needed, this file was going to be read anyway.
-                _, sr = sf.read(str(wav_paths[0]), dtype="float32", always_2d=False)
-                sr = int(sr)
-
-                merged = np.array([], dtype=np.float32)
-                for i, wp in enumerate(wav_paths):
-                    data, file_sr = sf.read(str(wp), dtype="float32")
-                    if data.ndim > 1:
-                        data = data[:, 0]
-                    # Resample if sample rate differs
-                    if abs(file_sr - sr) > 1:
-                        from scipy.signal import resample
-
-                        new_len = int(len(data) * sr / file_sr)
-                        data = resample(data, new_len)
-                        # Resampling can ring/overshoot past the original
-                        # [-1, 1] range near sharp transients (plosives,
-                        # sibilants) — clip here so that overshoot doesn't
-                        # turn into audible clipping noise later.
-                        data = np.clip(data, -1.0, 1.0)
-                    merged = np.concatenate([merged, data])
-
-                    # Add silence gap after this chunk (except last)
-                    if i < len(wav_paths) - 1:
-                        # Determine pause length: sentence end = long, comma = short
-                        chunk_text = chunks[i]
-                        pause = SENTENCE_PAUSE if ends_with_sentence(chunk_text) else COMMA_PAUSE
-                        gap = np.zeros(int(sr * pause), dtype=np.float32)
-                        merged = np.concatenate([merged, gap])
-
-                # Trailing silence pad — gives WASAPI's sample-rate converter room
-                # to flush cleanly instead of cutting off / glitching the last chunk.
-                tail_pad = np.zeros(int(sr * 0.35), dtype=np.float32)
-                merged = np.concatenate([merged, tail_pad])
-
-                # Safety clip in case anything still exceeds full scale —
-                # avoids hard digital-clipping noise on the loudest chunks.
-                merged = np.clip(merged, -1.0, 1.0)
-
-                # ---- Write merged WAV ----
-                import wave
-
-                out_path = self._tts._cache_dir / f"paused_{abs(hash(text)) % 1000000}.wav"
-                merged_i16 = np.clip(merged * 32767.0, -32768, 32767).astype(np.int16)
-                with wave.open(str(out_path), "wb") as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)
-                    wf.setframerate(sr)
-                    wf.writeframes(merged_i16.tobytes())
-
-                # ---- Play the full concatenated audio ----
-                self._tts.play(out_path, self.cfg.AUDIO)
-                self._last_tts_path = out_path
+            for i, wp in enumerate(wav_paths):
+                if self._interrupted.is_set():
+                    log.info("playback interrupted")
+                    break
+                self._tts.play(wp, self.cfg.AUDIO, self._interrupted)
+                self._last_tts_path = wp
+                if self._interrupted.is_set():
+                    log.info("playback interrupted")
+                    break
+                if i < len(wav_paths) - 1:
+                    pause = SENTENCE_PAUSE if ends_with_sentence(chunks[i]) else COMMA_PAUSE
+                    time.sleep(pause)
         finally:
             if self._wake is not None:
                 self._wake.set_playing_tts(False)

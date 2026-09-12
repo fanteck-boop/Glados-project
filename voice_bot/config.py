@@ -20,17 +20,20 @@ GROQ = {
     # Groq API base URL (OpenAI-compatible).
     "host": "https://api.groq.com/openai/v1",
     # Model to use.
-    "model": "allam-2-7b",
+    "model": "qwen/qwen3.8-27b",
     # Max tokens per response. GLaDOS replies are meant to be short (see
     # LLM.system_prompt), and Groq's on-demand tier caps output tokens per
-    # request well below 2048 for this model — keep this low to avoid 429s.
-    "max_tokens": 200,
+    # minute at 1000 for this model — keep well under that. 200 was too
+    # tight and occasionally produced empty responses on longer
+    # conversations; 400 leaves headroom while still being far below the
+    # per-minute cap for normal conversational pacing.
+    "max_tokens": 400,
     # Temperature.
     "temperature": 0.7,
 }
 
 # Which LLM backend the bot uses: "ollama" or "groq".
-LLM_BACKEND = "ollama"
+LLM_BACKEND = "groq"
 
 # Wake-word detection. Options:
 #   - use a lightweight local engine (e.g. porcupine / vosk-based custom keyword)
@@ -39,8 +42,12 @@ WAKE_WORD = {
     # Say this to wake GLaDOS back up after she's been put to sleep.
     "phrase": "submit",
     # Say this any time to put GLaDOS to sleep — she'll stop listening for
-    # commands (still hears the wake phrase) until woken back up.
-    "sleep_phrase": "shutdown",
+    # commands (still hears the wake phrase) until woken back up. Matches
+    # regardless of spacing ("goodnight" vs "good night") — see
+    # WakeWordListener._normalize.
+    "sleep_phrase": "goodnight",
+    # Say this while GLaDOS is speaking to cut her off immediately.
+    "interrupt_phrase": "stop",
     # If True, GLaDOS is listening and responds to everything from startup —
     # no need to say the wake phrase first. Say the sleep phrase to pause her.
     "start_active": True,

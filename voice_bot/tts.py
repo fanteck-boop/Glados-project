@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -337,8 +338,15 @@ class TTS:
     # Playback
     # ------------------------------------------------------------------
 
-    def play(self, wav_path: Path, audio_cfg: dict) -> None:
-        """Blocking playback of a WAV file via sounddevice to the configured output device."""
+    def play(self, wav_path: Path, audio_cfg: dict, interrupted: Optional[threading.Event] = None) -> None:
+        """Play a WAV file via sounddevice to the configured output device.
+
+        Polls for `interrupted` on this same thread and calls sd.stop() from
+        here rather than blocking on sd.wait() — a cross-thread sd.stop()
+        does not reliably release a concurrent sd.wait() on this WASAPI
+        setup (verified: it just hangs), so the wait has to be a same-thread
+        poll loop instead for the interrupt phrase to actually work.
+        """
         import soundfile as sf
         import sounddevice as sd
 
@@ -360,9 +368,30 @@ class TTS:
             sd.play(data, samplerate=sr, device=out_device, extra_settings=extra_settings)
         else:
             sd.play(data, samplerate=sr)
-        sd.wait()
+
+        if interrupted is None:
+            sd.wait()
+        else:
+            stream = sd.get_stream()
+            while stream is not None and stream.active:
+                if interrupted.is_set():
+                    sd.stop()
+                    break
+                time.sleep(0.05)
+
         logger.debug("playback finished: %s (device=%s, sr=%d, dur=%.2fs)",
                      wav_path, out_device, sr, len(data) / sr)
+
+    def stop(self) -> None:
+        """Immediately halt any in-progress playback.
+
+        Only reliable when called from the same thread that's polling in
+        play() — see the note there. Kept for the case play() was called
+        without an interrupted Event (e.g. external callers).
+        """
+        import sounddevice as sd
+
+        sd.stop()
 
     # ------------------------------------------------------------------
     # Lazy engine getter

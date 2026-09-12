@@ -263,6 +263,11 @@ class GroqClient:
         if choices:
             content = choices[0].get("message", {}).get("content") or ""
 
+        if not content:
+            logger.warning("Groq returned empty content: finish_reason=%s usage=%s",
+                            choices[0].get("finish_reason") if choices else None,
+                            body.get("usage"))
+
         with self._lock:
             self._history.append({"role": "assistant", "content": content})
             self._trim_history()

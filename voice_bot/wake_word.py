@@ -40,6 +40,7 @@ class WakeWordListener:
         self.sr: int = config.AUDIO["sample_rate"]
         self.phrase: str = config.WAKE_WORD["phrase"].lower()
         self.sleep_phrase: str = config.WAKE_WORD.get("sleep_phrase", "").lower()
+        self.interrupt_phrase: str = config.WAKE_WORD.get("interrupt_phrase", "").lower()
         self.energy_threshold: float = config.WAKE_WORD["vad_energy_threshold"]
         self.min_duration_sec: float = config.WAKE_WORD["vad_min_duration_sec"]
         self.silence_threshold: float = config.AUDIO["silence_threshold"]
@@ -47,17 +48,16 @@ class WakeWordListener:
         self.blocksize: int = 1024
 
         self._stt_model = stt_model  # injected STT wrapper
-        # A single worker is intentional: there is exactly one microphone, so
-        # there is never a need to transcribe two utterances at once. This
-        # also guarantees a transcription can never run concurrently with a
-        # TTS synthesis dispatched from the same callback chain (see
-        # _gpu_lock below for the belt-and-suspenders version of that).
-        self._executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="wake")
-        # Shared with Bot: held around every Whisper transcribe() and GLaDOS
-        # synthesize() call so the two never run on the CUDA context at the
-        # same time. That concurrent-CUDA-access window (STT on one worker
-        # thread, TTS on another) was the actual cause of the intermittent
-        # native crashes/hangs after a few exchanges.
+        # Two workers: one can be busy handling the current response (which
+        # blocks for the whole reply's playback) while the other transcribes
+        # whatever's said in the meantime — needed so an interrupt phrase
+        # spoken mid-speech is actually heard instead of queuing behind the
+        # response that's currently playing. Safe because _gpu_lock (not
+        # worker count) is what prevents STT and TTS from ever touching CUDA
+        # at the same time — that concurrent-CUDA-access race was the actual
+        # cause of the intermittent native crashes/hangs, not concurrency
+        # itself.
+        self._executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="wake")
         self._gpu_lock: threading.Lock = gpu_lock or threading.Lock()
 
         # Every utterance is buffered the same way; what happens once it's
@@ -95,9 +95,9 @@ class WakeWordListener:
         self._last_wake_time: float = 0.0
 
         # TTS playing flag — set by bot when GLaDOS is speaking. The mic
-        # stream itself is never stopped/restarted (that proved unreliable —
-        # some backends don't resume delivering callbacks after .stop());
-        # muting is done purely by dropping samples here.
+        # keeps listening throughout (needed to hear the interrupt phrase);
+        # what a finished transcription is allowed to trigger is gated on
+        # this flag in _on_transcription_done instead of dropping samples.
         self._playing_tts = threading.Event()
 
         # Diagnostics: loudest energy seen in the last ~2s, logged periodically
@@ -117,12 +117,10 @@ class WakeWordListener:
     def set_playing_tts(self, playing: bool) -> None:
         """Notify the listener whether TTS is currently playing audio.
 
-        The mic InputStream keeps running throughout — stopping/restarting
-        the same stream object was unreliable (some runs never resumed
-        delivering audio callbacks after .stop()). Muting is done purely by
-        dropping incoming samples in _on_samples while this flag is set;
-        the shared _gpu_lock is what actually prevents STT/TTS from ever
-        touching CUDA at the same time.
+        The mic keeps listening throughout so the interrupt phrase can be
+        heard — _on_transcription_done gates a finished transcription to
+        only react to that phrase while this flag is set, ignoring
+        everything else (including her own speech bleeding into the mic).
         """
         if playing:
             self._playing_tts.set()
@@ -194,10 +192,9 @@ class WakeWordListener:
             logger.exception("audio callback crashed — restarting stream safety net")
 
     def _on_samples(self, samples: np.ndarray) -> None:
-        # If GLaDOS is currently speaking, discard mic input to avoid feedback/capture
-        if self._playing_tts.is_set():
-            return
-
+        # Kept listening even while GLaDOS is speaking (gated in
+        # _on_transcription_done instead) so the interrupt phrase can
+        # actually be heard and cut her off mid-response.
         energy = compute_energy(samples)
 
         # Periodic diagnostic: log the loudest energy seen every ~2s so we can
@@ -266,6 +263,15 @@ class WakeWordListener:
 
         text_lower = text.lower().strip()
         self._notify("utt_ready", text)
+
+        if self._playing_tts.is_set():
+            # GLaDOS is currently speaking — the only thing that reacts is
+            # the interrupt phrase, so her own speech (or background noise
+            # picked up while she talks) can never misfire as a command.
+            if self._contains_phrase(text_lower, self.interrupt_phrase):
+                logger.info("interrupt phrase detected: %r", text)
+                self._notify("interrupt", None)
+            return
 
         if not self.cfg.WAKE_WORD.get("use_wake_word", True):
             logger.info("command captured (always-on): %r", text)
