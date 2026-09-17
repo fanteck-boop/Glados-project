@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import re
 import threading
@@ -41,6 +42,11 @@ class Bot:
          and their content injected as context.
       4. The LLM response is spoken back through GLaDOS TTS with
          sentence/comma pauses, routed to the ROG Strix Go headphones.
+
+    A subclass can customize command handling without editing this file —
+    see _maybe_handle_meta_command, _maybe_intercept,
+    _maybe_transform_command_text, and _after_response below, and
+    create_bot() at the bottom of this module.
     """
 
     SENTENCE_ENDS = ".!?"
@@ -159,7 +165,14 @@ class Bot:
         if not text or not text.strip():
             return
 
+        stripped = text.strip()
+        if self._maybe_handle_meta_command(stripped):
+            return
+
         log.info("command: %r", text[:120])
+
+        if self._maybe_intercept(text):
+            return
 
         # ---- File context injection ----
         file_context: Optional[str] = None
@@ -176,8 +189,17 @@ class Bot:
                 file_context = "\n\n".join(parts)
                 log.info("injected %d file(s) as context", len(paths))
 
+        command_text = self._maybe_transform_command_text(text)
+
         # ---- LLM response ----
-        response = self._llm.chat_with_context(text, file_context)
+        response = self._llm.chat_with_context(command_text, file_context)
+        if command_text != text:
+            # Scrub any one-off transform from history so it affects this
+            # reply only, not every later turn until it ages out.
+            clean_msg = text
+            if file_context:
+                clean_msg = f"[CONTEXT FROM FILES]\n{file_context}\n\n[END CONTEXT]\n\n{text}"
+            self._llm.replace_last_user_message(clean_msg)
         if not response:
             response = "Sorry, I couldn't think of a response."
 
@@ -189,6 +211,35 @@ class Bot:
             self._say_with_pauses(response)
         else:
             self._say(response)
+
+        self._after_response(command_text, text, response)
+
+    # ------------------------------------------------------------------
+    # Extension hooks — no-ops here. A subclass (see create_bot()) can
+    # override these to customize command handling without touching this
+    # file. Kept deliberately generic: this file has no idea what, if
+    # anything, uses them.
+    # ------------------------------------------------------------------
+
+    def _maybe_handle_meta_command(self, text: str) -> bool:
+        """Handle a non-conversational command (e.g. a slash command).
+        Return True to skip the normal LLM/TTS flow entirely."""
+        return False
+
+    def _maybe_intercept(self, text: str) -> bool:
+        """Short-circuit command handling before the LLM is involved.
+        Return True to stop processing this utterance."""
+        return False
+
+    def _maybe_transform_command_text(self, text: str) -> str:
+        """Return the text to actually send to the LLM for this turn.
+        Default: unchanged. The original `text` is still what's kept in
+        conversation history — see the scrub logic in _handle_command."""
+        return text
+
+    def _after_response(self, command_text: str, text: str, response: str) -> None:
+        """Called after a response has been spoken. Default: no-op."""
+        pass
 
     # ------------------------------------------------------------------
     # TTS with pauses at sentence/comma boundaries
@@ -236,7 +287,7 @@ class Bot:
           - Comma (,)              → ~0.15 s silence (half breath)
         """
         # Clean text: remove emoji and symbols that confuse TTS
-        clean = re.sub(r"[^\w\s.\,!?\-\'\"\,\u2014]", "", text).strip()
+        clean = re.sub(r"[^\w\s.\,!?\-\'\"\,—]", "", text).strip()
         if not clean:
             return
 
@@ -334,6 +385,32 @@ class Bot:
 
 
 # ------------------------------------------------------------------
+# Bot factory — loads a local customization module if present
+# ------------------------------------------------------------------
+
+def create_bot(config: Optional[cfg.Config] = None) -> Bot:
+    """Instantiate the bot.
+
+    If a sibling folder next to the project root contains a local
+    customization module, use the Bot subclass it defines instead of the
+    plain class here — lets a particular machine's own setup extend
+    behavior (see the Bot docstring for the extension points) without any
+    of that code living in this repo. A clone without that folder just
+    gets the plain Bot.
+    """
+    ext_path = Path(__file__).resolve().parents[2] / "Glados_private" / "extension.py"
+    if ext_path.exists():
+        try:
+            spec = importlib.util.spec_from_file_location("glados_local_extension", ext_path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module.CustomBot(config)
+        except Exception:
+            log.exception("failed to load local customization module, using plain Bot")
+    return Bot(config)
+
+
+# ------------------------------------------------------------------
 # Standalone entry point
 # ------------------------------------------------------------------
 
@@ -342,7 +419,7 @@ def main() -> None:
     from .audio_utils import setup_logging
 
     setup_logging("INFO")
-    bot = Bot()
+    bot = create_bot()
     bot.load()
     try:
         bot.start()

@@ -253,7 +253,7 @@ class TTS:
         dt = time.time() - t0
         logger.info("GLaDOS synthesis done in %.1fs -> %d samples (%.2fs)", dt, len(audio), len(audio) / sr)
 
-        audio = self._fade_out(audio, sr)
+        audio = self._fade_edges(audio, sr)
 
         out_name = f"glados_{abs(hash(text)) % 1000000}.wav"
         out_path = self._cache_dir / out_name
@@ -267,17 +267,21 @@ class TTS:
         return out_path
 
     @staticmethod
-    def _fade_out(audio: np.ndarray, sr: int, fade_ms: float = 15.0) -> np.ndarray:
-        """Apply a short linear fade-out to the tail of int16 audio.
+    def _fade_edges(audio: np.ndarray, sr: int, fade_ms: float = 15.0) -> np.ndarray:
+        """Apply a short linear fade-in and fade-out to int16 audio.
 
-        VITS-style models can end on an abrupt sample-boundary discontinuity,
-        which plays back as a click/pop on the last word. A short fade removes it.
+        VITS-style models can start/end on an abrupt sample-boundary
+        discontinuity, which plays back as a click/pop — since each chunk
+        (sentence/clause, see bot.py's _say_with_pauses) is synthesized and
+        played separately, that click lands right at the chunk boundary,
+        heard as a scratch at the end of words/sentences. A short fade on
+        both ends removes it; only the tail was covered before.
         """
         audio = audio.astype(np.float64)
-        fade_len = min(len(audio), int(sr * fade_ms / 1000))
+        fade_len = min(len(audio) // 2, int(sr * fade_ms / 1000))
         if fade_len > 0:
-            ramp = np.linspace(1.0, 0.0, fade_len)
-            audio[-fade_len:] *= ramp
+            audio[:fade_len] *= np.linspace(0.0, 1.0, fade_len)
+            audio[-fade_len:] *= np.linspace(1.0, 0.0, fade_len)
         return np.clip(audio, -32768, 32767).astype(np.int16)
 
     def _synthesize_xtts(self, text: str) -> Path:

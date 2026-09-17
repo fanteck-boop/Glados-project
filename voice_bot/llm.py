@@ -83,6 +83,23 @@ class OllamaClient:
         with self._lock:
             self._history.clear()
 
+    def replace_last_user_message(self, text: str) -> None:
+        """Overwrite the most recently appended user turn's stored content.
+
+        Used when the text actually sent to the model (e.g. with a one-off
+        tone instruction spliced in) shouldn't persist verbatim in history —
+        the instruction should affect this reply only, not linger in context
+        for later turns. Called after chat_with_context() returns, by which
+        point the assistant's reply is already the last entry — so this
+        searches backward for the most recent "user" turn rather than
+        assuming history[-1] is still it.
+        """
+        with self._lock:
+            for msg in reversed(self._history):
+                if msg["role"] == "user":
+                    msg["content"] = text
+                    return
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
@@ -202,6 +219,23 @@ class GroqClient:
     def reset(self) -> None:
         with self._lock:
             self._history.clear()
+
+    def replace_last_user_message(self, text: str) -> None:
+        """Overwrite the most recently appended user turn's stored content.
+
+        Used when the text actually sent to the model (e.g. with a one-off
+        tone instruction spliced in) shouldn't persist verbatim in history —
+        the instruction should affect this reply only, not linger in context
+        for later turns. Called after chat_with_context() returns, by which
+        point the assistant's reply is already the last entry — so this
+        searches backward for the most recent "user" turn rather than
+        assuming history[-1] is still it.
+        """
+        with self._lock:
+            for msg in reversed(self._history):
+                if msg["role"] == "user":
+                    msg["content"] = text
+                    return
 
     # ------------------------------------------------------------------
     # Internal
